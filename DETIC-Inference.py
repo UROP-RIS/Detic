@@ -114,7 +114,8 @@ def setup_model(args):
     model = predictor.model
     model.eval()
     aug = predictor.aug
-    return model, predictor, aug
+    thing_classes = demo.metadata.thing_classes
+    return model, predictor, aug, thing_classes
 
 
 class ImageDataset(Dataset):
@@ -148,7 +149,9 @@ def collate_fn(batch):
     return batch_inputs, img_names, raw_imgs
 
 
-def save_visualization(img, img_name, boxes, scores, classes, output_dir):
+def save_visualization(
+    img, img_name, boxes, scores, classes, output_dir, thing_classes
+):
 
     ## Draw the bounding box on the image
     COLORS = np.random.uniform(0, 255, size=(len(classes), 3))
@@ -160,7 +163,7 @@ def save_visualization(img, img_name, boxes, scores, classes, output_dir):
         color = COLORS[i % len(COLORS)]
         cv2.rectangle(img_copy, (x1, y1), (x2, y2), color, 1)
 
-        label = f"{cls}: {score:.2f}"
+        label = f"{thing_classes[cls]}: {score:.2f}"
 
         cv2.putText(
             img_copy, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1
@@ -170,12 +173,24 @@ def save_visualization(img, img_name, boxes, scores, classes, output_dir):
     cv2.imwrite(path, img_copy)
 
 
+def save(boxes, scores, classes, thing_classes, img_name, output_dir):
+    ## Save the bounding boxes, scores, and classes to npy files
+    classes_label = list(map(lambda x: thing_classes[x], classes))
+    path = os.path.join(output_dir, img_name + "_detect" + ".npz")
+    data = {
+        "boxes": boxes,
+        "scores": scores,
+        "classes": classes_label,
+    }
+    np.savez(path, **data)
+
+
 if __name__ == "__main__":
     args = get_parser().parse_args()
     setup_logger(name="fvcore")
     logger = setup_logger()
     logger.info("Arguments: " + str(args))
-    model, predictor, aug = setup_model(args)
+    model, predictor, aug, thing_classes = setup_model(args)
     images = get_imgs_from_directory(INPUT_ROOT)
 
     dataset = ImageDataset(images, aug)
@@ -190,16 +205,23 @@ if __name__ == "__main__":
     for i, (batch_inputs, batch_names, raw_imgs) in enumerate(tqdm.tqdm(dataloader)):
         with torch.no_grad():
             predictions = model(batch_inputs)
-            # for raw_img, prediction, img_name in zip(
-            #     raw_imgs, predictions, batch_names
-            # ):
-            #     instances = prediction["instances"].to("cpu")
-            #     boxes = instances.pred_boxes.tensor.numpy()
-            #     scores = instances.scores.numpy()
-            #     classes = instances.pred_classes.numpy()
-            #     save_visualization(
-            #         raw_img, img_name, boxes, scores, classes, OUTPUT_ROOT
-            #     )
+            for raw_img, prediction, img_name in zip(
+                raw_imgs, predictions, batch_names
+            ):
+                instances = prediction["instances"].to("cpu")
+                boxes = instances.pred_boxes.tensor.numpy()
+                scores = instances.scores.numpy()
+                classes = instances.pred_classes.numpy()
+                # save_visualization(
+                #     raw_img,
+                #     img_name,
+                #     boxes,
+                #     scores,
+                #     classes,
+                #     OUTPUT_ROOT,
+                #     thing_classes,
+                # )
+                save(boxes, scores, classes, thing_classes, img_name, OUTPUT_ROOT)
 
 
 # if __name__ == "__main__":
