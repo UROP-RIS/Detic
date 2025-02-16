@@ -12,35 +12,33 @@ from detectron2.data.detection_utils import read_image
 from detectron2.utils.logger import setup_logger
 
 sys.path.insert(0, "third_party/CenterNet2/")
+sys.path.insert(0, "../")
 from centernet.config import add_centernet_config
 from detic.config import add_detic_config
 from detic.predictor import VisualizationDemo
 from torch.utils.data import DataLoader, Dataset
 from pathlib import Path
+from utils.rainbow import rainbow_print
+from utils.io import load_npz_as_dict
+from utils.misc import dispatch_mp
+
 
 # Constant
-INPUT_ROOT = "/data/datasets/zguobd/reasoning_caption_generator/data/refcoco/train2014"
-OUTPUT_ROOT = (
-    "/data/datasets/zguobd/reasoning_caption_generator/data/refcoco/train2014_detic"
-)
+INPUT_ROOT = "/data/datasets/tzhangbu/Cherry-Pick/data/refcoco/unc/testB_batch"
+OUTPUT_ROOT = "/data/datasets/zguobd/Refined-MaskGen/data/unc/testB_batch/detic"
+NUM_WORKERS = 4
 
 
-BATCH_SIZE = 16
-
-# INPUT_ROOT = "/data/datasets/zguobd/reasoning_caption_generator/data/demo/input"
-# OUTPUT_ROOT = "/data/datasets/zguobd/reasoning_caption_generator/data/demo/output"
-
-
-def get_imgs_from_directory(directory):
-    images_path = [file for file in Path(directory).glob("*.jpg") if file.is_file()]
-    assert len(images_path) > 0, "No images found in {}".format(directory)
-    return images_path
+def get_batch_from_dir(directory):
+    batch_path = [batch for batch in Path(directory).glob("*.npz") if batch.is_file()]
+    assert len(batch_path) > 0, "No images found in {}".format(directory)
+    rainbow_print("green", f"Found {len(batch_path)} batches in {directory}")
+    return batch_path
 
 
-def setup_cfg(args):
+def setup_cfg(args, device):
     cfg = get_cfg()
-    if args.cpu:
-        cfg.MODEL.DEVICE = "cpu"
+    cfg.MODEL.DEVICE = device
     add_centernet_config(cfg)
     add_detic_config(cfg)
     cfg.merge_from_file(args.config_file)
@@ -107,46 +105,17 @@ def get_parser():
     return parser
 
 
-def setup_model(args):
-    cfg = setup_cfg(args)
-    demo = VisualizationDemo(cfg, args)
-    predictor = demo.predictor
-    model = predictor.model
-    model.eval()
-    aug = predictor.aug
-    thing_classes = demo.metadata.thing_classes
-    return model, predictor, aug, thing_classes
-
-
-class ImageDataset(Dataset):
-
-    def __init__(self, images_path, aug):
-        self.images_path = images_path
-        self.aug = aug
-
-    def __len__(self):
-        return len(self.images_path)
-
-    def __getitem__(self, index):
-        img_path = self.images_path[index].as_posix()
-        img_name = self.images_path[index].stem
-        raw_img = read_image(img_path, format="RGB")
-        height, width = raw_img.shape[:2]
-        img = self.aug.get_transform(raw_img).apply_image(raw_img)
-        img = img.transpose(2, 0, 1).astype("float32")
-        img_tensor = torch.as_tensor(img)
-        return raw_img, img_tensor, img_name, height, width
-
-
-def collate_fn(batch):
-    batch_inputs = []
-    img_names = []
-    raw_imgs = []
-    for raw_img, img_tensor, img_name, height, width in batch:
-        batch_inputs.append({"image": img_tensor, "height": height, "width": width})
-        img_names.append(img_name)
-        raw_imgs.append(raw_img)
-    return batch_inputs, img_names, raw_imgs
+def save(boxes, scores, classes, masks, thing_classes, img_name, output_dir):
+    ## Save the bounding boxes, scores, and classes to npy files
+    classes_label = list(map(lambda x: thing_classes[x], classes))
+    path = os.path.join(output_dir, img_name + "_detect" + ".npz")
+    data = {
+        "boxes": boxes,
+        "scores": scores,
+        "classes": classes_label,
+        "detic_masks": masks,
+    }
+    np.savez(path, **data)
 
 
 def save_visualization(
@@ -173,37 +142,68 @@ def save_visualization(
     cv2.imwrite(path, img_copy)
 
 
-def save(boxes, scores, classes, thing_classes, img_name, output_dir):
-    ## Save the bounding boxes, scores, and classes to npy files
-    classes_label = list(map(lambda x: thing_classes[x], classes))
-    path = os.path.join(output_dir, img_name + "_detect" + ".npz")
-    data = {
-        "boxes": boxes,
-        "scores": scores,
-        "classes": classes_label,
-    }
-    np.savez(path, **data)
+def setup_model(args, device):
+    cfg = setup_cfg(args, device)
+    demo = VisualizationDemo(cfg, args)
+    predictor = demo.predictor
+    model = predictor.model
+    model.eval()
+    aug = predictor.aug
+    thing_classes = demo.metadata.thing_classes
+    return model, predictor, aug, thing_classes
 
 
-if __name__ == "__main__":
-    args = get_parser().parse_args()
-    setup_logger(name="fvcore")
-    logger = setup_logger()
-    logger.info("Arguments: " + str(args))
-    model, predictor, aug, thing_classes = setup_model(args)
-    images = get_imgs_from_directory(INPUT_ROOT)
+class ImageDataset(Dataset):
 
-    dataset = ImageDataset(images, aug)
+    def __init__(self, batches_path, aug):
+        self.batches_path = batches_path
+        self.aug = aug
+
+    def __len__(self):
+        return len(self.batches_path)
+
+    def __getitem__(self, index):
+        batch_path = self.batches_path[index].as_posix()
+        batch_name = self.batches_path[index].stem
+        raw_img = load_npz_as_dict(batch_path)["im_batch"]
+        height, width = raw_img.shape[:2]
+        img = self.aug.get_transform(raw_img).apply_image(raw_img)
+        img = img.transpose(2, 0, 1).astype("float32")
+        img_tensor = torch.as_tensor(img)
+        return raw_img, img_tensor, batch_name, height, width
+
+
+def collate_fn(batch):
+    batch_inputs = []
+    img_names = []
+    raw_imgs = []
+    for raw_img, img_tensor, img_name, height, width in batch:
+        batch_inputs.append({"image": img_tensor, "height": height, "width": width})
+        img_names.append(img_name)
+        raw_imgs.append(raw_img)
+    return batch_inputs, img_names, raw_imgs
+
+
+def mp_func(cfg: dict, data_chunk: list, args):
+
+    device = cfg["device"]
+    worker_id = int(device.split(":")[-1])
+    batch_size = cfg["batch_size"]
+    model, predictor, aug, thing_classes = setup_model(args, device)
+    dataset = ImageDataset(data_chunk, aug)
     dataloader = DataLoader(
         dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=8,
+        num_workers=NUM_WORKERS,
         collate_fn=collate_fn,
     )
-
-    for i, (batch_inputs, batch_names, raw_imgs) in enumerate(tqdm.tqdm(dataloader)):
+    for batch_inputs, batch_names, raw_imgs in tqdm.tqdm(
+        dataloader, position=worker_id
+    ):
         with torch.no_grad():
+            for batch in batch_inputs:
+                batch["image"] = batch["image"].to(device)
             predictions = model(batch_inputs)
             for raw_img, prediction, img_name in zip(
                 raw_imgs, predictions, batch_names
@@ -212,54 +212,55 @@ if __name__ == "__main__":
                 boxes = instances.pred_boxes.tensor.numpy()
                 scores = instances.scores.numpy()
                 classes = instances.pred_classes.numpy()
-                # save_visualization(
-                #     raw_img,
-                #     img_name,
-                #     boxes,
-                #     scores,
-                #     classes,
-                #     OUTPUT_ROOT,
-                #     thing_classes,
-                # )
-                save(boxes, scores, classes, thing_classes, img_name, OUTPUT_ROOT)
+                masks = instances.pred_masks.numpy()
+                save(
+                    boxes, scores, classes, masks, thing_classes, img_name, OUTPUT_ROOT
+                )
 
 
-# if __name__ == "__main__":
-#     args = get_parser().parse_args()
-#     setup_logger(name="fvcore")
-#     logger = setup_logger()
-#     logger.info("Arguments: " + str(args))
-#     model, predictor, aug = setup_model(args)
-#     # prepare image
-#     path = args.input[0]
-#     raw_img = read_image(path, format="RGB")
+if __name__ == "__main__":
+    mp.set_start_method("spawn")
+    args = get_parser().parse_args()
+    setup_logger(name="fvcore")
+    logger = setup_logger()
+    logger.info("Arguments: " + str(args))
+    batches = get_batch_from_dir(INPUT_ROOT)
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
-#     height, width = raw_img.shape[:2]
-#     img = aug.get_transform(raw_img).apply_image(raw_img)
-#     img = img.transpose(2, 0, 1).astype("float32")
-#     img_tensor = torch.as_tensor(img).to(model.device)
+    cfgs = [
+        {"device": "cuda:0", "batch_size": 16},
+        {"device": "cuda:1", "batch_size": 16},
+    ]
+    processes = dispatch_mp(cfgs, batches, mp_func, args)
 
-#     inputs = {"image": img_tensor, "height": height, "width": width}
-#     with torch.no_grad():
-#         predictions = model([inputs])[0]
+    for p in processes:
+        p.start()
 
-#     ## Draw the bounding box on the image
-#     instances = predictions["instances"].to("cpu")
-#     boxes = instances.pred_boxes.tensor.numpy()
-#     scores = instances.scores.cpu().numpy()
-#     classes = instances.pred_classes.cpu().numpy()
+    for p in processes:
+        p.join()
 
-#     COLORS = np.random.uniform(0, 255, size=(len(classes), 3))
-#     img_copy = raw_img.copy()
-#     for i, (box, score, cls) in enumerate(zip(boxes, scores, classes)):
-#         x1, y1, x2, y2 = map(int, box)
-#         color = COLORS[i % len(COLORS)]
-#         cv2.rectangle(img_copy, (x1, y1), (x2, y2), color, 2)
+    # model, predictor, aug, thing_classes = setup_model(args)
 
-#         label = f"{cls}: {score:.2f}"
+    # dataset = ImageDataset(images, aug)
+    # dataloader = DataLoader(
+    #     dataset,
+    #     batch_size=BATCH_SIZE,
+    #     shuffle=False,
+    #     num_workers=NUM_WORKERS,
+    #     collate_fn=collate_fn,
+    # )
 
-#         cv2.putText(
-#             img_copy, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
-#         )
-
-#     cv2.imwrite("./output.jpg", img_copy)
+    # for i, (batch_inputs, batch_names, raw_imgs) in enumerate(tqdm.tqdm(dataloader)):
+    #     with torch.no_grad():
+    #         predictions = model(batch_inputs)
+    #         for raw_img, prediction, img_name in zip(
+    #             raw_imgs, predictions, batch_names
+    #         ):
+    #             instances = prediction["instances"].to("cpu")
+    #             boxes = instances.pred_boxes.tensor.numpy()
+    #             scores = instances.scores.numpy()
+    #             classes = instances.pred_classes.numpy()
+    #             masks = instances.pred_masks.numpy()
+    #             save(
+    #                 boxes, scores, classes, masks, thing_classes, img_name, OUTPUT_ROOT
+    #             )
