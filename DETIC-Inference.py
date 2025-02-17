@@ -7,6 +7,8 @@ import cv2
 import tqdm
 import sys
 import torch
+import time
+import warnings
 from detectron2.config import get_cfg
 from detectron2.data.detection_utils import read_image
 from detectron2.utils.logger import setup_logger
@@ -22,11 +24,11 @@ from utils.rainbow import rainbow_print
 from utils.io import load_npz_as_dict
 from utils.misc import dispatch_mp
 
+warnings.simplefilter("ignore")
 
 # Constant
 INPUT_ROOT = "/data/datasets/tzhangbu/Cherry-Pick/data/refcoco/unc/testB_batch"
 OUTPUT_ROOT = "/data/datasets/zguobd/Refined-MaskGen/data/unc/testB_batch/detic"
-NUM_WORKERS = 4
 
 
 def get_batch_from_dir(directory):
@@ -108,14 +110,19 @@ def get_parser():
 def save(boxes, scores, classes, masks, thing_classes, img_name, output_dir):
     ## Save the bounding boxes, scores, and classes to npy files
     classes_label = list(map(lambda x: thing_classes[x], classes))
-    path = os.path.join(output_dir, img_name + "_detect" + ".npz")
-    data = {
-        "boxes": boxes,
-        "scores": scores,
-        "classes": classes_label,
-        "detic_masks": masks,
-    }
-    np.savez(path, **data)
+    num_detect = len(boxes)
+    assert (
+        num_detect == len(scores) == len(classes_label) == len(masks)
+    ), "Number of detections does not match"
+    for i in range(num_detect):
+        path = os.path.join(output_dir, f"{img_name}_detect_{i}.npz")
+        data = {
+            "box": boxes[i],
+            "score": scores[i],
+            "class": classes_label[i],
+            "detic_mask": masks[i],
+        }
+        np.savez(path, **data)
 
 
 def save_visualization(
@@ -195,9 +202,10 @@ def mp_func(cfg: dict, data_chunk: list, args):
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=NUM_WORKERS,
+        num_workers=4,
         collate_fn=collate_fn,
     )
+    torch.cuda.empty_cache()
     for batch_inputs, batch_names, raw_imgs in tqdm.tqdm(
         dataloader, position=worker_id
     ):
@@ -214,7 +222,7 @@ def mp_func(cfg: dict, data_chunk: list, args):
                 classes = instances.pred_classes.numpy()
                 masks = instances.pred_masks.numpy()
                 save(
-                    boxes, scores, classes, masks, thing_classes, img_name, OUTPUT_ROOT
+                    boxes, scores, classes, masks, thing_classes, img_name, args.output
                 )
 
 
@@ -224,14 +232,21 @@ if __name__ == "__main__":
     setup_logger(name="fvcore")
     logger = setup_logger()
     logger.info("Arguments: " + str(args))
-    batches = get_batch_from_dir(INPUT_ROOT)
-    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    batches = get_batch_from_dir(args.input[0])
+    os.makedirs(args.output, exist_ok=True)
 
     cfgs = [
         {"device": "cuda:0", "batch_size": 16},
         {"device": "cuda:1", "batch_size": 16},
+        {"device": "cuda:2", "batch_size": 16},
+        {"device": "cuda:3", "batch_size": 16},
+        {"device": "cuda:4", "batch_size": 16},
+        {"device": "cuda:5", "batch_size": 16},
+        {"device": "cuda:6", "batch_size": 16},
+        {"device": "cuda:7", "batch_size": 16},
     ]
     processes = dispatch_mp(cfgs, batches, mp_func, args)
+    start_time = time.time()
 
     for p in processes:
         p.start()
@@ -239,28 +254,5 @@ if __name__ == "__main__":
     for p in processes:
         p.join()
 
-    # model, predictor, aug, thing_classes = setup_model(args)
-
-    # dataset = ImageDataset(images, aug)
-    # dataloader = DataLoader(
-    #     dataset,
-    #     batch_size=BATCH_SIZE,
-    #     shuffle=False,
-    #     num_workers=NUM_WORKERS,
-    #     collate_fn=collate_fn,
-    # )
-
-    # for i, (batch_inputs, batch_names, raw_imgs) in enumerate(tqdm.tqdm(dataloader)):
-    #     with torch.no_grad():
-    #         predictions = model(batch_inputs)
-    #         for raw_img, prediction, img_name in zip(
-    #             raw_imgs, predictions, batch_names
-    #         ):
-    #             instances = prediction["instances"].to("cpu")
-    #             boxes = instances.pred_boxes.tensor.numpy()
-    #             scores = instances.scores.numpy()
-    #             classes = instances.pred_classes.numpy()
-    #             masks = instances.pred_masks.numpy()
-    #             save(
-    #                 boxes, scores, classes, masks, thing_classes, img_name, OUTPUT_ROOT
-    #             )
+    end_time = time.time()
+    rainbow_print("green", f"Total building time: {(end_time - start_time):.2f}")
